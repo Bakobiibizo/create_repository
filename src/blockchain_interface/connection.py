@@ -77,7 +77,6 @@ class ConnectionManager:
         self.max_connections = max_connections if max_connections is not None else env_manager.get_var_as_int("BLOCKCHAIN_MAX_CONNECTIONS", 5)
         self.idle_timeout = idle_timeout if idle_timeout is not None else env_manager.get_var_as_float("BLOCKCHAIN_IDLE_TIMEOUT", 300.0)
         self.heartbeat_interval = heartbeat_interval if heartbeat_interval is not None else env_manager.get_var_as_float("BLOCKCHAIN_HEARTBEAT_INTERVAL", 30.0)
-        
         self.connection_pool = queue.Queue()
         self.active_connections = {}
         self.lock = threading.RLock()

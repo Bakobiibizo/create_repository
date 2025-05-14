@@ -9,23 +9,29 @@ import logging
 import threading
 import time
 import queue
-from typing import Dict, List, Optional, Tuple, Any, Callable
+import random
+from typing import Dict, List, Optional, Tuple, Any, Callable, Type
 from urllib.parse import urlparse
+import concurrent.futures
 
 from websocket import WebSocketConnectionClosedException
 from substrateinterface import SubstrateInterface
 
 from src.utilities.environment_manager import get_environment_manager
+from src.utilities.path_manager import get_path_manager
+from src.utilities.console_manager import get_console_manager
+from src.blockchain_interface.interfaces import ConnectionManagerInterface, BlockchainConnectionInterface
 
 logger = logging.getLogger(__name__)
 
 
-class ConnectionManager:
+class ConnectionManager(ConnectionManagerInterface):
     """
     Manages a pool of WebSocket connections to the blockchain.
     
-    This class provides methods for creating, reusing, and terminating connections,
-    as well as implementing heartbeat mechanisms and reconnection logic.
+    This class implements the ConnectionManagerInterface and provides methods for creating, 
+    reusing, and terminating connections, as well as implementing heartbeat mechanisms and 
+    reconnection logic.
     
     Attributes:
         url (str): The WebSocket URL of the blockchain node.
@@ -37,6 +43,10 @@ class ConnectionManager:
         lock (threading.RLock): Lock for thread-safe operations.
         heartbeat_thread (threading.Thread): Thread for running heartbeat checks.
         running (bool): Whether the connection manager is running.
+        connection_semaphore (threading.Semaphore): Semaphore for limiting connections.
+        connection_timeout (float): Timeout for acquiring a connection.
+        connection_priorities (Dict): Dictionary of connection priorities.
+        connection_factory (Type): Factory class for creating connections.
     """
     
     def __init__(
@@ -44,7 +54,10 @@ class ConnectionManager:
         url: Optional[str] = None, 
         max_connections: Optional[int] = None, 
         idle_timeout: Optional[float] = None, 
-        heartbeat_interval: Optional[float] = None
+        heartbeat_interval: Optional[float] = None,
+        connection_timeout: Optional[float] = None,
+        connection_factory: Optional[Type[BlockchainConnectionInterface]] = None,
+        config_path: Optional[str] = None
     ):
         """
         Initialize a new ConnectionManager.
@@ -61,12 +74,27 @@ class ConnectionManager:
             heartbeat_interval (Optional[float], optional): Interval in seconds between heartbeat checks.
                 If not provided, it will be read from the environment variable BLOCKCHAIN_HEARTBEAT_INTERVAL.
                 Defaults to 30.0.
+            connection_timeout (Optional[float], optional): Timeout in seconds for acquiring a connection.
+                If not provided, it will be read from the environment variable BLOCKCHAIN_CONNECTION_TIMEOUT.
+                Defaults to 10.0.
+            connection_factory (Optional[Type[BlockchainConnectionInterface]], optional): Factory class for creating connections.
+                If not provided, SubstrateInterface will be used directly.
+            config_path (Optional[str], optional): Path to the configuration file.
+                If not provided, it will use the default path from the path manager.
                 
         Raises:
             ValueError: If the URL is invalid or not a WebSocket URL.
         """
-        # Get environment manager
+        # Get environment manager and path manager
         env_manager = get_environment_manager()
+        path_manager = get_path_manager()
+        self.console = get_console_manager()
+        
+        # Get configuration path
+        self.config_path = config_path
+        if self.config_path is None:
+            # Use path manager to get the default configuration path
+            self.config_path = path_manager.get_path('blockchain_config', default='~/.comai/blockchain_config.json')
         
         # Get URL from environment if not provided
         self.url = url if url is not None else env_manager.get_var("BLOCKCHAIN_URL", None)
@@ -77,16 +105,29 @@ class ConnectionManager:
         self.max_connections = max_connections if max_connections is not None else env_manager.get_var_as_int("BLOCKCHAIN_MAX_CONNECTIONS", 5)
         self.idle_timeout = idle_timeout if idle_timeout is not None else env_manager.get_var_as_float("BLOCKCHAIN_IDLE_TIMEOUT", 300.0)
         self.heartbeat_interval = heartbeat_interval if heartbeat_interval is not None else env_manager.get_var_as_float("BLOCKCHAIN_HEARTBEAT_INTERVAL", 30.0)
+        self.connection_timeout = connection_timeout if connection_timeout is not None else env_manager.get_var_as_float("BLOCKCHAIN_CONNECTION_TIMEOUT", 10.0)
+        
+        # Initialize connection factory
+        self.connection_factory = connection_factory
+        
+        # Initialize connection pool and semaphore
         self.connection_pool = queue.Queue()
         self.active_connections = {}
+        self.connection_semaphore = threading.Semaphore(self.max_connections)
+        self.connection_priorities = {}
+        
+        # Initialize threading components
         self.lock = threading.RLock()
         self.heartbeat_thread = None
         self.running = False
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_connections)
         
         # Validate URL
         parsed_url = urlparse(self.url)
         if not parsed_url.scheme in ['ws', 'wss']:
             raise ValueError(f"Invalid URL scheme: {parsed_url.scheme}. Expected 'ws' or 'wss'.")
+            
+        self.console.info(f"Initialized connection manager for {self.url} with max {self.max_connections} connections") 
     
     def start(self) -> None:
         """
@@ -128,44 +169,68 @@ class ConnectionManager:
             
             self.active_connections = {}
     
-    def get_connection(self) -> Tuple[str, SubstrateInterface]:
+    def get_connection(self, priority: int = 0) -> Tuple[str, Any]:
         """
         Get a connection from the pool or create a new one if needed.
         
+        Args:
+            priority (int, optional): Priority of the connection request (higher is more important).
+                Defaults to 0.
+        
         Returns:
-            Tuple[str, SubstrateInterface]: A tuple containing the connection ID and the connection.
+            Tuple[str, Any]: A tuple containing the connection ID and the connection.
             
         Raises:
             ConnectionError: If unable to create a connection after retries.
+            TimeoutError: If unable to acquire a connection within the timeout period.
         """
-        with self.lock:
-            # Check if we've reached the maximum number of connections
-            if len(self.active_connections) >= self.max_connections and self.connection_pool.empty():
-                raise ConnectionError(f"Maximum number of connections reached ({self.max_connections})")
-            
-            # Try to get a connection from the pool
-            try:
-                if not self.connection_pool.empty():
-                    connection_id, connection = self.connection_pool.get_nowait()
-                    
-                    # Check if the connection is still alive
-                    if not self._check_connection(connection):
-                        # Connection is dead, create a new one
-                        connection.close()
+        # Try to acquire the semaphore with timeout
+        if not self.connection_semaphore.acquire(timeout=self.connection_timeout):
+            raise TimeoutError(f"Timed out waiting for a connection after {self.connection_timeout} seconds")
+        
+        try:
+            with self.lock:
+                # Store the priority for this request
+                request_id = f"req_{id(threading.current_thread())}_{time.time()}"
+                self.connection_priorities[request_id] = priority
+                
+                # Try to get a connection from the pool
+                try:
+                    if not self.connection_pool.empty():
+                        connection_id, connection = self.connection_pool.get_nowait()
+                        
+                        # Check if the connection is still alive
+                        if not self._check_connection(connection):
+                            # Connection is dead, create a new one
+                            self.console.warning(f"Connection {connection_id} is dead, creating a new one")
+                            connection.close()
+                            connection_id, connection = self._create_connection()
+                    else:
+                        # Create a new connection
                         connection_id, connection = self._create_connection()
-                else:
-                    # Create a new connection
-                    connection_id, connection = self._create_connection()
-                
-                # Add the connection to active connections
-                self.active_connections[connection_id] = {
-                    "connection": connection,
-                    "last_used": time.time()
-                }
-                
-                return connection_id, connection
-            except Exception as e:
-                raise ConnectionError(f"Failed to get connection: {str(e)}")
+                    
+                    # Add the connection to active connections
+                    self.active_connections[connection_id] = {
+                        "connection": connection,
+                        "last_used": time.time(),
+                        "priority": priority
+                    }
+                    
+                    # Remove the priority entry
+                    del self.connection_priorities[request_id]
+                    
+                    return connection_id, connection
+                except Exception as e:
+                    # Release the semaphore on error
+                    self.connection_semaphore.release()
+                    # Remove the priority entry
+                    if request_id in self.connection_priorities:
+                        del self.connection_priorities[request_id]
+                    raise ConnectionError(f"Failed to get connection: {str(e)}")
+        except Exception as e:
+            # Release the semaphore on any error
+            self.connection_semaphore.release()
+            raise e
     
     def release_connection(self, connection_id: str) -> None:
         """
@@ -177,27 +242,44 @@ class ConnectionManager:
         Returns:
             None
         """
-        with self.lock:
-            if connection_id in self.active_connections:
-                connection = self.active_connections[connection_id]["connection"]
-                del self.active_connections[connection_id]
-                self.connection_pool.put((connection_id, connection))
+        try:
+            with self.lock:
+                if connection_id in self.active_connections:
+                    connection = self.active_connections[connection_id]["connection"]
+                    del self.active_connections[connection_id]
+                    self.connection_pool.put((connection_id, connection))
+                    self.console.debug(f"Released connection {connection_id} back to pool")
+                else:
+                    self.console.warning(f"Attempted to release unknown connection {connection_id}")
+        finally:
+            # Always release the semaphore
+            self.connection_semaphore.release()
     
-    def _create_connection(self) -> Tuple[str, SubstrateInterface]:
+    def _create_connection(self) -> Tuple[str, Any]:
         """
         Create a new connection to the blockchain.
         
         Returns:
-            Tuple[str, SubstrateInterface]: A tuple containing the connection ID and the connection.
+            Tuple[str, Any]: A tuple containing the connection ID and the connection.
             
         Raises:
             ConnectionError: If unable to create a connection.
         """
         try:
-            connection = SubstrateInterface(url=self.url)
+            # Use the connection factory if provided, otherwise use SubstrateInterface directly
+            if self.connection_factory is not None:
+                connection = self.connection_factory(url=self.url)
+                # Ensure connection is established
+                if hasattr(connection, 'connect'):
+                    connection.connect()
+            else:
+                connection = SubstrateInterface(url=self.url)
+                
             connection_id = f"conn_{id(connection)}_{time.time()}"
+            self.console.debug(f"Created new connection {connection_id}")
             return connection_id, connection
         except Exception as e:
+            self.console.error(f"Failed to create connection: {str(e)}")
             raise ConnectionError(f"Failed to create connection: {str(e)}")
     
     def _run_heartbeat(self) -> None:

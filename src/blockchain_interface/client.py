@@ -6,25 +6,28 @@ using the Substrate interface. It handles connection initialization, RPC command
 and error handling.
 """
 
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Tuple
 import logging
 import time
+import random
 from urllib.parse import urlparse
 
 from substrateinterface import SubstrateInterface
 from websocket import WebSocketConnectionClosedException
 
 from src.utilities.environment_manager import get_environment_manager
+from src.utilities.path_manager import get_path_manager
+from src.blockchain_interface.interfaces import BlockchainConnectionInterface
 
 logger = logging.getLogger(__name__)
 
 
-class SubstrateClient:
+class SubstrateClient(BlockchainConnectionInterface):
     """
     A client for interacting with the CommuneAI blockchain using Substrate interface.
     
-    This class provides methods for connecting to the blockchain, executing RPC commands,
-    and handling errors and retries.
+    This class implements the BlockchainConnectionInterface and provides methods for 
+    connecting to the blockchain, executing RPC commands, and handling errors and retries.
     
     Attributes:
         url (str): The WebSocket URL of the blockchain node.
@@ -32,13 +35,21 @@ class SubstrateClient:
         retry_delay (float): Delay between retry attempts in seconds.
         connection (Optional[SubstrateInterface]): The active connection to the blockchain.
         connected (bool): Whether the client is currently connected.
+        circuit_breaker_threshold (int): Number of consecutive failures before circuit breaker trips.
+        circuit_breaker_reset_time (float): Time in seconds before circuit breaker resets.
+        circuit_breaker_failures (int): Current count of consecutive failures.
+        circuit_breaker_last_failure (float): Timestamp of last failure.
+        circuit_breaker_open (bool): Whether the circuit breaker is open (preventing operations).
     """
     
     def __init__(
         self, 
         url: Optional[str] = None, 
         retry_attempts: Optional[int] = None, 
-        retry_delay: Optional[float] = None
+        retry_delay: Optional[float] = None,
+        circuit_breaker_threshold: Optional[int] = None,
+        circuit_breaker_reset_time: Optional[float] = None,
+        config_path: Optional[str] = None
     ):
         """
         Initialize a new SubstrateClient.
@@ -52,12 +63,27 @@ class SubstrateClient:
             retry_delay (Optional[float], optional): Delay between retry attempts in seconds.
                 If not provided, it will be read from the environment variable BLOCKCHAIN_RETRY_DELAY.
                 Defaults to 1.0.
+            circuit_breaker_threshold (Optional[int], optional): Number of consecutive failures before circuit breaker trips.
+                If not provided, it will be read from the environment variable BLOCKCHAIN_CIRCUIT_BREAKER_THRESHOLD.
+                Defaults to 5.
+            circuit_breaker_reset_time (Optional[float], optional): Time in seconds before circuit breaker resets.
+                If not provided, it will be read from the environment variable BLOCKCHAIN_CIRCUIT_BREAKER_RESET_TIME.
+                Defaults to 60.0.
+            config_path (Optional[str], optional): Path to the configuration file.
+                If not provided, it will use the default path from the path manager.
                 
         Raises:
             ValueError: If the URL is invalid or not a WebSocket URL.
         """
-        # Get environment manager
+        # Get environment manager and path manager
         env_manager = get_environment_manager()
+        path_manager = get_path_manager()
+        
+        # Get configuration path
+        self.config_path = config_path
+        if self.config_path is None:
+            # Use path manager to get the default configuration path
+            self.config_path = path_manager.get_path('blockchain_config', default='~/.comai/blockchain_config.json')
         
         # Get URL from environment if not provided
         self.url = url if url is not None else env_manager.get_var("BLOCKCHAIN_URL", None)
@@ -67,6 +93,15 @@ class SubstrateClient:
         # Get retry parameters from environment if not provided
         self.retry_attempts = retry_attempts if retry_attempts is not None else env_manager.get_var_as_int("BLOCKCHAIN_RETRY_ATTEMPTS", 3)
         self.retry_delay = retry_delay if retry_delay is not None else env_manager.get_var_as_float("BLOCKCHAIN_RETRY_DELAY", 1.0)
+        
+        # Get circuit breaker parameters from environment if not provided
+        self.circuit_breaker_threshold = circuit_breaker_threshold if circuit_breaker_threshold is not None else env_manager.get_var_as_int("BLOCKCHAIN_CIRCUIT_BREAKER_THRESHOLD", 5)
+        self.circuit_breaker_reset_time = circuit_breaker_reset_time if circuit_breaker_reset_time is not None else env_manager.get_var_as_float("BLOCKCHAIN_CIRCUIT_BREAKER_RESET_TIME", 60.0)
+        
+        # Initialize circuit breaker state
+        self.circuit_breaker_failures = 0
+        self.circuit_breaker_last_failure = 0
+        self.circuit_breaker_open = False
         
         self.connection = None
         self.connected = False
@@ -86,9 +121,15 @@ class SubstrateClient:
         Raises:
             ConnectionError: If connection fails after all retry attempts.
         """
+        # Check if circuit breaker is open
+        if self._is_circuit_breaker_open():
+            logger.warning(f"Circuit breaker is open. Waiting until {self.circuit_breaker_reset_time} seconds have passed since last failure.")
+            return False
+            
         try:
             return self._retry_operation(self._connect_impl)
         except Exception as e:
+            self._record_failure()
             raise ConnectionError(f"Failed to connect to blockchain at {self.url}: {str(e)}")
     
     def disconnect(self) -> None:
@@ -137,7 +178,7 @@ class SubstrateClient:
     
     def _retry_operation(self, operation, *args, **kwargs):
         """
-        Retry an operation with exponential backoff.
+        Retry an operation with exponential backoff and jitter.
         
         Args:
             operation: The function to retry.
@@ -153,16 +194,25 @@ class SubstrateClient:
         last_exception = None
         for attempt in range(self.retry_attempts):
             try:
-                return operation(*args, **kwargs)
+                result = operation(*args, **kwargs)
+                # Reset circuit breaker on success
+                self._reset_circuit_breaker()
+                return result
             except Exception as e:
                 last_exception = e
                 logger.warning(
                     f"Operation failed (attempt {attempt + 1}/{self.retry_attempts}): {str(e)}"
                 )
                 if attempt < self.retry_attempts - 1:
-                    # Exponential backoff
+                    # Exponential backoff with jitter
                     delay = self.retry_delay * (2 ** attempt)
+                    # Add jitter (±20% of delay)
+                    jitter = delay * 0.2 * (2 * random.random() - 1)
+                    delay = max(0, delay + jitter)
                     time.sleep(delay)
+        
+        # Record failure for circuit breaker
+        self._record_failure()
         
         if last_exception:
             raise last_exception
@@ -197,6 +247,62 @@ class SubstrateClient:
             Exception: If RPC execution fails.
         """
         return self.connection.rpc_request(method, params)
+    
+    def is_connected(self) -> bool:
+        """
+        Check if the connection is active.
+        
+        Returns:
+            bool: True if connected, False otherwise.
+        """
+        return self.connected and self.connection is not None
+        
+    def _is_circuit_breaker_open(self) -> bool:
+        """
+        Check if the circuit breaker is open.
+        
+        Returns:
+            bool: True if open, False otherwise.
+        """
+        # If circuit breaker is not open, return False
+        if not self.circuit_breaker_open:
+            return False
+            
+        # Check if enough time has passed to reset the circuit breaker
+        if time.time() - self.circuit_breaker_last_failure > self.circuit_breaker_reset_time:
+            logger.info("Circuit breaker reset time has passed. Resetting circuit breaker.")
+            self._reset_circuit_breaker()
+            return False
+            
+        return True
+        
+    def _record_failure(self) -> None:
+        """
+        Record a failure for the circuit breaker.
+        
+        Returns:
+            None
+        """
+        self.circuit_breaker_failures += 1
+        self.circuit_breaker_last_failure = time.time()
+        
+        # Check if circuit breaker should trip
+        if self.circuit_breaker_failures >= self.circuit_breaker_threshold:
+            logger.warning(f"Circuit breaker tripped after {self.circuit_breaker_failures} consecutive failures.")
+            self.circuit_breaker_open = True
+            
+    def _reset_circuit_breaker(self) -> None:
+        """
+        Reset the circuit breaker.
+        
+        Returns:
+            None
+        """
+        if self.circuit_breaker_open or self.circuit_breaker_failures > 0:
+            logger.info("Resetting circuit breaker.")
+        
+        self.circuit_breaker_failures = 0
+        self.circuit_breaker_open = False
     
     def __enter__(self):
         """
